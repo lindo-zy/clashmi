@@ -1,0 +1,372 @@
+# ClashMi iOS IPA 构建 workflow
+#
+# 背景: 本仓库 .gitignore 排除了 4 项构建 iOS 版本必需的内容,
+#       workflow 会按下面的顺序自动获取, 缺一不可:
+#
+#   1. ../libclash-vpn-service        Dart 包 (pubspec.yaml dependency_overrides 指向的兄弟目录)
+#   2. ../board-service               Dart 包 (同上)
+#   3. bind/apple/Libclash.xcframework  mihomo 内核预编译框架 (Xcode 工程引用)
+#   4. lib/app/private/app_url_utils_private.dart  私有 Dart 文件
+#                                         (缺失时自动使用 tools/ci/stubs 下的存根,
+#                                          仅跳过官方遥测签名与订阅中转下载通道, 其余功能不受影响)
+#
+# 依赖获取方式 (按优先级):
+#   方式 A: 在本仓库 tag 为 `deps` 的 Release 上传资产 (推荐, 见 docs/build-ipa.md):
+#             - libclash-vpn-service.tar.gz
+#             - board-service.tar.gz
+#             - Libclash.xcframework.zip
+#             - app_url_utils_private.dart (可选, 不传则用存根)
+#   方式 B: 配置仓库 Variable 指向私有 git 仓库 + PAT Secret:
+#             vars.LIBCLASH_VPN_SERVICE_REPO / vars.BOARD_SERVICE_REPO
+#             secrets.DEPS_PAT
+#
+# 产物: 默认构建"未签名 IPA"(可配合侧载工具签名安装);
+#       手动触发时可选择 manual 模式, 使用仓库 Secrets 中的证书/描述文件签名导出。
+
+name: Build iOS IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      signing:
+        description: "签名方式: unsigned=不签名 / manual=用 Secrets 里的证书签名"
+        type: choice
+        default: unsigned
+        options:
+          - unsigned
+          - manual
+      export_method:
+        description: "签名导出方式(仅 manual 时生效)"
+        type: choice
+        default: ad-hoc
+        options:
+          - ad-hoc
+          - app-store
+          - development
+      flutter_version:
+        description: "Flutter 版本 (需 >= 3.44.0)"
+        required: false
+        default: "3.44.0"
+      deps_release_tag:
+        description: "依赖资产所在的 Release 标签"
+        required: false
+        default: "deps"
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build IPA
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    env:
+      SIGNING: ${{ github.event_name == 'workflow_dispatch' && inputs.signing || 'unsigned' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---------- 依赖准备 ----------
+      - name: Provision private build dependencies
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPS_TAG: ${{ inputs.deps_release_tag || 'deps' }}
+          DEPS_PAT: ${{ secrets.DEPS_PAT }}
+          LIBCLASH_REPO: ${{ vars.LIBCLASH_VPN_SERVICE_REPO }}
+          BOARD_REPO: ${{ vars.BOARD_SERVICE_REPO }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          PARENT="$(dirname "$GITHUB_WORKSPACE")"
+
+          install_pkg_archive() { # $1=archive $2=dest
+            local archive="$1" dest="$2" tmp src
+            tmp="$(mktemp -d)"
+            case "$archive" in
+              *.tar.gz|*.tgz) tar -xzf "$archive" -C "$tmp" ;;
+              *.zip)          unzip -q "$archive" -d "$tmp" ;;
+              *) echo "::error::不支持的归档格式: $archive"; return 1 ;;
+            esac
+            src="$(find "$tmp" -maxdepth 3 -name pubspec.yaml | head -1)"
+            if [ -z "$src" ]; then
+              echo "::error::$archive 中找不到 pubspec.yaml"; return 1
+            fi
+            mkdir -p "$dest"
+            cp -R "$(dirname "$src")"/. "$dest"/
+          }
+
+          install_xcframework() { # $1=archive
+            local archive="$1" tmp src
+            tmp="$(mktemp -d)"
+            case "$archive" in
+              *.tar.gz|*.tgz) tar -xzf "$archive" -C "$tmp" ;;
+              *.zip)          unzip -q "$archive" -d "$tmp" ;;
+              *) echo "::error::不支持的归档格式: $archive"; return 1 ;;
+            esac
+            src="$(find "$tmp" -maxdepth 3 -type d -name "Libclash.xcframework" | head -1)"
+            if [ -z "$src" ]; then
+              echo "::error::$archive 中找不到 Libclash.xcframework"; return 1
+            fi
+            rm -rf bind/apple/Libclash.xcframework
+            cp -R "$src" bind/apple/Libclash.xcframework
+          }
+
+          # ---- 方式 A: 从本仓库 Release 下载 ----
+          ASSETS_DIR="$RUNNER_TEMP/deps-assets"
+          if gh release view "$DEPS_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            rm -rf "$ASSETS_DIR"; mkdir -p "$ASSETS_DIR"
+            gh release download "$DEPS_TAG" --repo "$GITHUB_REPOSITORY" --dir "$ASSETS_DIR" --clobber \
+              --pattern "*libclash-vpn-service*" \
+              --pattern "*board-service*" \
+              --pattern "*Libclash.xcframework*" \
+              --pattern "*app_url_utils_private*" || true
+            for f in "$ASSETS_DIR"/*; do
+              [ -e "$f" ] || continue
+              case "$(basename "$f")" in
+                *libclash-vpn-service*)
+                  install_pkg_archive "$f" "$PARENT/libclash-vpn-service" || true ;;
+                *board-service*)
+                  install_pkg_archive "$f" "$PARENT/board-service" || true ;;
+                *Libclash.xcframework*|*libclash.xcframework*)
+                  install_xcframework "$f" || true ;;
+                *app_url_utils_private*)
+                  mkdir -p lib/app/private
+                  cp "$f" lib/app/private/app_url_utils_private.dart ;;
+              esac
+            done
+          else
+            echo "::notice::仓库中不存在 tag 为 $DEPS_TAG 的 Release, 跳过资产下载"
+          fi
+
+          # ---- 方式 B: 从私有 git 仓库克隆 ----
+          clone_repo() { # $1=host/repo $2=dest
+            local url="$1" dest="$2"
+            [ -z "$url" ] && return 0
+            [ -d "$dest/.git" ] && return 0
+            git clone --depth 1 "https://x-access-token:${DEPS_PAT}@${url#https://}" "$dest"
+          }
+          if [ -n "$DEPS_PAT" ]; then
+            clone_repo "$LIBCLASH_REPO" "$PARENT/libclash-vpn-service"
+            clone_repo "$BOARD_REPO"  "$PARENT/board-service"
+          fi
+
+          # ---- 私有 Dart 文件缺失时注入存根 ----
+          if [ ! -f lib/app/private/app_url_utils_private.dart ]; then
+            mkdir -p lib/app/private
+            cp tools/ci/stubs/app_url_utils_private.dart lib/app/private/app_url_utils_private.dart
+            echo "::notice::已注入 CI 存根 lib/app/private/app_url_utils_private.dart (跳过官方遥测参数与订阅中转下载通道)"
+          fi
+
+          # ---- 校验 ----
+          missing=0
+          if [ ! -d "$PARENT/libclash-vpn-service" ]; then
+            echo "::error::缺少依赖 ../libclash-vpn-service (pubspec.yaml dependency_overrides 要求的兄弟目录)。\
+          请在 \$DEPS_TAG Release 上传 libclash-vpn-service.tar.gz, 或配置 vars.LIBCLASH_VPN_SERVICE_REPO + secrets.DEPS_PAT。详见 docs/build-ipa.md"
+            missing=1
+          fi
+          if [ ! -d "$PARENT/board-service" ]; then
+            echo "::error::缺少依赖 ../board-service。\
+          请在 \$DEPS_TAG Release 上传 board-service.tar.gz, 或配置 vars.BOARD_SERVICE_REPO + secrets.DEPS_PAT。详见 docs/build-ipa.md"
+            missing=1
+          fi
+          if [ ! -d bind/apple/Libclash.xcframework ]; then
+            echo "::error::缺少 bind/apple/Libclash.xcframework (mihomo 内核, 被 .gitignore 排除)。\
+          请在 \$DEPS_TAG Release 上传 Libclash.xcframework.zip。详见 docs/build-ipa.md"
+            missing=1
+          fi
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+          echo "依赖就绪:"
+          echo "  libclash-vpn-service: $(ls "$PARENT/libclash-vpn-service" | head -3 | tr '\n' ' ')"
+          echo "  board-service:        $(ls "$PARENT/board-service" | head -3 | tr '\n' ' ')"
+          echo "  Libclash.xcframework: $(ls bind/apple/Libclash.xcframework)"
+
+      # ---------- Flutter ----------
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ inputs.flutter_version || '3.44.0' }}
+          channel: stable
+          cache: true
+
+      - name: Flutter doctor
+        run: flutter doctor -v
+
+      - name: Enable Swift Package Manager
+        run: flutter config --enable-swift-package-manager
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Read version from pubspec
+        id: ver
+        run: |
+          set -euo pipefail
+          v="$(grep -E '^version:' pubspec.yaml | sed 's/version:[[:space:]]*//')"
+          name="${v%%+*}"; num="${v##*+}"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "num=$num"   >> "$GITHUB_OUTPUT"
+          echo "full=$v"    >> "$GITHUB_OUTPUT"
+
+      # ---------- 签名 (仅 manual 模式) ----------
+      - name: Import signing assets
+        if: env.SIGNING == 'manual'
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_P12_BASE64: ${{ secrets.APPLE_P12_BASE64 }}
+          APPLE_P12_PASSWORD: ${{ secrets.APPLE_P12_PASSWORD }}
+          PROFILE_MAIN: ${{ secrets.APPLE_PROVISION_PROFILE_BASE64 }}
+          PROFILE_SERVICE: ${{ secrets.APPLE_PROFILE_CLASHMISERVICE_BASE64 }}
+          PROFILE_WIDGET: ${{ secrets.APPLE_PROFILE_CLASHMIWIDGET_BASE64 }}
+          EXPORT_METHOD: ${{ inputs.export_method }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+
+          if [ -z "$APPLE_P12_BASE64" ] || [ -z "$PROFILE_MAIN" ] || [ -z "$APPLE_TEAM_ID" ]; then
+            echo "::error::manual 签名需要配置 Secrets: APPLE_P12_BASE64 / APPLE_P12_PASSWORD / APPLE_PROVISION_PROFILE_BASE64 / APPLE_TEAM_ID (可选: APPLE_PROFILE_CLASHMISERVICE_BASE64 / APPLE_PROFILE_CLASHMIWIDGET_BASE64)"
+            exit 1
+          fi
+          PROFILE_SERVICE="${PROFILE_SERVICE:-$PROFILE_MAIN}"
+          PROFILE_WIDGET="${PROFILE_WIDGET:-$PROFILE_MAIN}"
+
+          case "$EXPORT_METHOD" in
+            development) IDENTITY="Apple Development" ;;
+            *)           IDENTITY="Apple Distribution" ;;
+          esac
+
+          # --- 证书导入临时钥匙串 ---
+          KC="$RUNNER_TEMP/ci-build.keychain"
+          KC_PASS="$(openssl rand -hex 16)"
+          security delete-keychain "$KC" 2>/dev/null || true
+          security create-keychain -p "$KC_PASS" "$KC"
+          security default-keychain -s "$KC"
+          security unlock-keychain -p "$KC_PASS" "$KC"
+          security set-keychain-settings -t 3600 -u "$KC"
+          echo "$APPLE_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$APPLE_P12_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: -k "$KC_PASS" "$KC" >/dev/null
+
+          # --- 描述文件安装并取名称 ---
+          PP_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
+          mkdir -p "$PP_DIR"
+          install_profile() { # $1=base64 -> 输出 profile 名称
+            local f="$RUNNER_TEMP/$RANDOM.mobileprovision"
+            printf '%s' "$1" | base64 --decode > "$f"
+            local plist="$RUNNER_TEMP/$RANDOM.plist"
+            security cms -D -i "$f" > "$plist" 2>/dev/null
+            local uuid
+            uuid=$(plutil -extract UUID raw -o - "$plist")
+            cp "$f" "$PP_DIR/$uuid.mobileprovision"
+            plutil -extract Name raw -o - "$plist"
+          }
+          P_MAIN=$(install_profile "$PROFILE_MAIN")
+          P_SERVICE=$(install_profile "$PROFILE_SERVICE")
+          P_WIDGET=$(install_profile "$PROFILE_WIDGET")
+          echo "profiles: main=$P_MAIN service=$P_SERVICE widget=$P_WIDGET"
+
+          # --- 改写 Xcode 工程签名设置 ---
+          ruby tools/ci/apply_signing.rb ios/Runner.xcodeproj \
+            "$APPLE_TEAM_ID" "$IDENTITY" "$P_MAIN" "$P_SERVICE" "$P_WIDGET"
+
+          # --- ExportOptions.plist ---
+          cat > ios/ExportOptions.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>$EXPORT_METHOD</string>
+            <key>teamID</key><string>$APPLE_TEAM_ID</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>signingCertificate</key><string>$IDENTITY</string>
+            <key>stripSwiftSymbols</key><true/>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>com.nebula.clashmi</key><string>$P_MAIN</string>
+              <key>com.nebula.clashmi.clashmiService</key><string>$P_SERVICE</string>
+              <key>com.nebula.clashmi.clashmiWidget</key><string>$P_WIDGET</string>
+            </dict>
+          </dict>
+          </plist>
+          EOF
+
+      # ---------- 构建 ----------
+      - name: Build unsigned IPA
+        if: env.SIGNING != 'manual'
+        run: |
+          set -euo pipefail
+          flutter build ios --release --no-codesign
+          app="$(find build/ios/iphoneos -maxdepth 1 -name '*.app' | head -1)"
+          [ -n "$app" ] || { echo "::error::未找到构建产物 .app"; exit 1; }
+          mkdir -p build/ipa/Payload "build/dist"
+          cp -R "$app" "build/ipa/Payload/"
+          (cd build/ipa && zip -qry "../dist/clashmi-${{ steps.ver.outputs.name }}-ios-unsigned.ipa" Payload)
+
+      - name: Build signed IPA
+        if: env.SIGNING == 'manual'
+        run: |
+          set -euo pipefail
+          flutter build ipa --release --export-options-plist=ios/ExportOptions.plist
+          mkdir -p "build/dist"
+          ipa="$(find build/ios/ipa -maxdepth 1 -name '*.ipa' | head -1)"
+          [ -n "$ipa" ] || { echo "::error::未找到导出的 .ipa"; exit 1; }
+          cp "$ipa" "build/dist/clashmi-${{ steps.ver.outputs.name }}-ios-${{ inputs.export_method }}.ipa"
+
+      # ---------- 产物 ----------
+      - name: Collect dSYMs
+        if: env.SIGNING == 'manual'
+        run: |
+          set -euo pipefail
+          mkdir -p build/dist/dsyms
+          find build/ios/archive -maxdepth 4 -type d -name "*.dSYM" \
+            -exec cp -R {} build/dist/dsyms/ \; 2>/dev/null || true
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: clashmi-ios-ipa-${{ env.SIGNING }}
+          path: build/dist/*.ipa
+          if-no-files-found: error
+
+      - name: Upload dSYMs artifact
+        if: env.SIGNING == 'manual'
+        uses: actions/upload-artifact@v4
+        with:
+          name: clashmi-ios-dsyms
+          path: build/dist/dsyms
+          if-no-files-found: ignore
+
+      - name: Job summary
+        run: |
+          {
+            echo "## ClashMi iOS 构建完成"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 版本 | ${{ steps.ver.outputs.full }} |"
+            echo "| 签名 | ${{ env.SIGNING }} |"
+            echo "| 触发 | ${{ github.event_name }} @ ${{ github.ref_name }} |"
+            echo ""
+            echo '产物见 Actions Artifacts / Releases。未签名 IPA 可用 AltStore / Sideloadly / TrollStore / 爱思助手 自签安装。'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload to release (tag push)
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" --title "ClashMi $GITHUB_REF_NAME" \
+            --generate-notes --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
+          gh release upload "$GITHUB_REF_NAME" build/dist/*.ipa --clobber --repo "$GITHUB_REPOSITORY"

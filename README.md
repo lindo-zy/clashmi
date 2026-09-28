@@ -72,6 +72,10 @@
 - Windows >= 10 （amd64）
 - Linux （amd64）
 
+### iOS CI 构建
+
+本仓库提供 GitHub Actions 一键打包 iOS IPA 的 workflow，详见 [docs/build-ipa.md](docs/build-ipa.md)。
+
 ### 常见问题
 
 > [FAQ|cn](https://clashmi.app/guide/faq)
